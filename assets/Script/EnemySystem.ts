@@ -11,6 +11,7 @@ import {
     v3,
 } from 'cc';
 import { Enemy } from './Enemy';
+import { ChasePlayer } from './Skill/Enemy/ChasePlayer';
 const { ccclass, property } = _decorator;
 
 @ccclass('EnemySystem')
@@ -61,6 +62,14 @@ export class EnemySystem extends Component {
     // 禁用时停止定时生成。
     onDisable() {
         this.unschedule(this.generate);
+    }
+
+    // 销毁时清空活动列表与对象池，避免场景切换后残留。
+    onDestroy() {
+        this.unschedule(this.generate);
+        this._activeEnemies.length = 0;
+        this._sceneEnemies.length = 0;
+        this._enemyPool.clear();
     }
 
     // 执行一次生成检查并在未达上限时创建敌人。
@@ -146,25 +155,29 @@ export class EnemySystem extends Component {
         }
     }
 
-    // 配置单个敌人的目标与移动参数。
+    // 配置单个敌人的追踪技能参数。
     private configureEnemy(enemyNode: Node) {
         const enemyComp = enemyNode.getComponent(Enemy);
         if (!enemyComp) {
             return;
         }
+        let chaseComp = enemyNode.getComponent(ChasePlayer);
+        if (!chaseComp) {
+            chaseComp = enemyNode.addComponent(ChasePlayer);
+        }
 
-        enemyComp.target = this.player;
-        enemyComp.moveSpeed = Math.max(0, this.moveSpeed);
-        enemyComp.stopDistance = Math.max(0, this.stopDistance);
+        chaseComp.target = this.player;
+        chaseComp.moveSpeed = Math.max(0, this.moveSpeed);
+        chaseComp.stopDistance = Math.max(0, this.stopDistance);
     }
 
-    // 清空单个敌人的目标引用。
+    // 清空单个敌人的追踪目标引用。
     private clearEnemyTarget(enemyNode: Node) {
-        const enemyComp = enemyNode.getComponent(Enemy);
-        if (!enemyComp) {
+        const chaseComp = enemyNode.getComponent(ChasePlayer);
+        if (!chaseComp) {
             return;
         }
-        enemyComp.target = null;
+        chaseComp.target = null;
     }
 
     // 在未绑定玩家时自动查找名为 Player 的节点。
