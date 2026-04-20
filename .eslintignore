@@ -1,0 +1,6 @@
+﻿library/
+local/
+temp/
+settings/
+node_modules/
+*.meta
