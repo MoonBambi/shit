@@ -1,4 +1,5 @@
 import { _decorator, Component, EventKeyboard, input, Input, KeyCode, Vec3, v3 } from 'cc';
+import { NetClient } from './Net/NetClient';
 const { ccclass, property } = _decorator;
 
 @ccclass('PlayerController')
@@ -10,6 +11,7 @@ export class PlayerController extends Component {
     private readonly _keyPressed: Map<KeyCode, boolean> = new Map();
     private readonly _displacement: Vec3 = v3();
     private readonly _nextPosition: Vec3 = v3();
+    private readonly _worldPosition: Vec3 = v3();
 
     onEnable() {
         input.on(Input.EventType.KEY_DOWN, this.onKeyDown, this);
@@ -32,6 +34,15 @@ export class PlayerController extends Component {
     }
 
     update(dt: number) {
+        if (dt <= 0) {
+            return;
+        }
+
+        const netClient = NetClient.getInstance();
+        if (netClient && netClient.isConnected() && !netClient.isGameStarted()) {
+            return;
+        }
+
         this.updateMoveDirection();
 
         if (this._moveDirection.lengthSqr() > 0) {
@@ -40,6 +51,12 @@ export class PlayerController extends Component {
             this._nextPosition.set(this.node.position).add(this._displacement);
             this.node.setPosition(this._nextPosition);
         }
+
+        if (!netClient) {
+            return;
+        }
+        this.node.getWorldPosition(this._worldPosition);
+        netClient.sendLocalPlayerState(this._worldPosition, this._moveDirection);
     }
 
     private updateMoveDirection() {

@@ -11,8 +11,13 @@ import {
     v3,
 } from 'cc';
 import { Enemy } from './Enemy';
+import { NetClient, EnemyNetState } from './Net/NetClient';
 import { ChasePlayer } from './Skill/Enemy/ChasePlayer';
+import { Eat } from './Skill/Enemy/Eat';
 const { ccclass, property } = _decorator;
+
+const NET_ENEMY_ID_KEY = '__netEnemyId';
+type EnemyNodeWithNetId = Node & { __netEnemyId?: string };
 
 @ccclass('EnemySystem')
 export class EnemySystem extends Component {
@@ -43,42 +48,93 @@ export class EnemySystem extends Component {
     @property({ tooltip: 'Enemy stop distance to target.' })
     public stopDistance: number = 16;
 
+    @property({ tooltip: 'Whether this client can simulate enemy spawn and AI.' })
+    public isNetworkAuthority: boolean = true;
+
+    @property({ tooltip: 'Enemy snapshot broadcast interval (seconds).' })
+    public enemySyncIntervalSeconds: number = 0.1;
+
+    @property({ tooltip: 'Replica enemy interpolation speed.' })
+    public enemyInterpolationSpeed: number = 14;
+
     private readonly _enemyPool: NodePool = new NodePool();
     private readonly _activeEnemies: Node[] = [];
     private readonly _sceneEnemies: Node[] = [];
     private readonly _spawnCenter: Vec3 = v3();
     private readonly _spawnWorldPos: Vec3 = v3();
-    private _generateCallCount: number = 0;
+    private readonly _enemyVisualPos: Vec3 = v3();
+    private readonly _snapshotBuffer: EnemyNetState[] = [];
+    private readonly _replicatedEnemies: Map<string, Node> = new Map();
+    private readonly _replicatedTargetPos: Map<string, Vec3> = new Map();
 
-    // 启用时初始化玩家并启动定时生成。
+    private _netClient: NetClient | null = null;
+    private _generateCallCount: number = 0;
+    private _enemyIdCounter: number = 1;
+    private _runtimeAuthority: boolean = false;
+    private _snapshotListenerAttached: boolean = false;
+
+    private readonly _onEnemySnapshot = (states: EnemyNetState[]) => {
+        this.applyEnemySnapshot(states);
+    };
+
     onEnable() {
+        this._netClient = NetClient.getInstance();
         this.resolvePlayer();
         this.syncActiveEnemiesFromScene();
-        this.unschedule(this.generate);
-        this.schedule(this.generate, Math.max(0.1, this.spawnIntervalSeconds));
-        this.generate();
+        this.refreshNetworkMode(true);
     }
 
-    // 禁用时停止定时生成。
     onDisable() {
         this.unschedule(this.generate);
+        this.unschedule(this.syncEnemySnapshot);
+        this.detachSnapshotListener();
     }
 
-    // 销毁时清空活动列表与对象池，避免场景切换后残留。
     onDestroy() {
-        this.unschedule(this.generate);
+        this.onDisable();
         this._activeEnemies.length = 0;
         this._sceneEnemies.length = 0;
+        this._snapshotBuffer.length = 0;
+        this._replicatedEnemies.clear();
+        this._replicatedTargetPos.clear();
         this._enemyPool.clear();
     }
 
-    // 执行一次生成检查并在未达上限时创建敌人。
+    update(dt: number) {
+        const latestNet = NetClient.getInstance();
+        if (latestNet !== this._netClient) {
+            this.detachSnapshotListener();
+            this._netClient = latestNet;
+            this.refreshNetworkMode(true);
+            return;
+        }
+
+        const authority = this.isAuthoritative();
+        if (authority !== this._runtimeAuthority) {
+            this.refreshNetworkMode(true);
+            return;
+        }
+
+        if (!authority) {
+            this.updateReplicaEnemyVisuals(dt);
+        }
+
+        if (!authority && !this._snapshotListenerAttached && this._netClient) {
+            this.attachSnapshotListener();
+        }
+    }
+
     public generate() {
+        if (!this.isAuthoritative()) {
+            return;
+        }
+
         this.resolvePlayer();
         this.compactActiveEnemies();
         this._generateCallCount++;
         if (this.shouldSyncSceneEnemies()) {
             this.syncActiveEnemiesFromScene();
+            this.refreshAllEnemyConfigs();
         }
 
         const maxCount = Math.max(1, Math.floor(this.maxEnemyCount));
@@ -89,8 +145,10 @@ export class EnemySystem extends Component {
         this.spawnEnemy();
     }
 
-    // 从对象池或预制体创建并初始化一个敌人实例。
     public spawnEnemy() {
+        if (!this.isAuthoritative()) {
+            return;
+        }
         if (!this.enemyPrefab) {
             console.warn('[EnemySystem] enemyPrefab is not assigned.');
             return;
@@ -110,14 +168,14 @@ export class EnemySystem extends Component {
         enemyNode.setWorldPosition(this._spawnWorldPos);
         enemyNode.active = true;
 
-        this.configureEnemy(enemyNode);
+        this.ensureEnemyNetId(enemyNode);
+        this.configureEnemy(enemyNode, true);
 
         if (this._activeEnemies.indexOf(enemyNode) < 0) {
             this._activeEnemies.push(enemyNode);
         }
     }
 
-    // 回收敌人节点并从活动列表中移除。
     public recycleEnemy(enemyNode: Node) {
         const index = this._activeEnemies.indexOf(enemyNode);
         if (index >= 0) {
@@ -125,12 +183,193 @@ export class EnemySystem extends Component {
         }
 
         this.clearEnemyTarget(enemyNode);
-
         enemyNode.active = false;
         this._enemyPool.put(enemyNode);
     }
 
-    // 清理活动列表中已失效的节点引用。
+    private isAuthoritative(): boolean {
+        const net = this._netClient || NetClient.getInstance();
+        if (!net || !net.isConnected()) {
+            return this.isNetworkAuthority;
+        }
+        if (!net.isGameStarted()) {
+            return false;
+        }
+        return this.isNetworkAuthority && net.isHost();
+    }
+
+    private refreshNetworkMode(force: boolean = false) {
+        const authority = this.isAuthoritative();
+        const previousAuthority = this._runtimeAuthority;
+        if (!force && authority === this._runtimeAuthority) {
+            return;
+        }
+        this._runtimeAuthority = authority;
+
+        this.resolvePlayer();
+        this.refreshAllEnemyConfigs();
+
+        this.unschedule(this.generate);
+        this.unschedule(this.syncEnemySnapshot);
+
+        if (authority) {
+            this.detachSnapshotListener();
+            this.schedule(this.generate, Math.max(0.1, this.spawnIntervalSeconds));
+            this.schedule(this.syncEnemySnapshot, Math.max(0.05, this.enemySyncIntervalSeconds));
+            this.generate();
+            return;
+        }
+
+        if (previousAuthority || force) {
+            this.cleanupForReplicaMode();
+        }
+        this.attachSnapshotListener();
+    }
+
+    private attachSnapshotListener() {
+        if (!this._netClient || this._snapshotListenerAttached) {
+            return;
+        }
+        this._netClient.onEnemySnapshot(this._onEnemySnapshot);
+        this._snapshotListenerAttached = true;
+    }
+
+    private detachSnapshotListener() {
+        if (!this._snapshotListenerAttached) {
+            return;
+        }
+        if (this._netClient) {
+            this._netClient.offEnemySnapshot(this._onEnemySnapshot);
+        }
+        this._snapshotListenerAttached = false;
+    }
+
+    private syncEnemySnapshot() {
+        if (!this.isAuthoritative()) {
+            return;
+        }
+
+        const net = this._netClient || NetClient.getInstance();
+        if (!net || !net.isConnected() || !net.isHost()) {
+            return;
+        }
+
+        this.compactActiveEnemies();
+        this._snapshotBuffer.length = 0;
+
+        for (const enemy of this._activeEnemies) {
+            if (!enemy || !enemy.isValid || !enemy.activeInHierarchy) {
+                continue;
+            }
+
+            const enemyId = this.ensureEnemyNetId(enemy);
+            enemy.getWorldPosition(this._spawnWorldPos);
+            this._snapshotBuffer.push({
+                id: enemyId,
+                x: this._spawnWorldPos.x,
+                y: this._spawnWorldPos.y,
+                z: this._spawnWorldPos.z,
+            });
+        }
+
+        net.sendEnemySnapshot(this._snapshotBuffer);
+    }
+
+    private applyEnemySnapshot(states: EnemyNetState[]) {
+        if (this.isAuthoritative()) {
+            return;
+        }
+        if (!this.enemyPrefab) {
+            return;
+        }
+
+        const parent = this.resolveSpawnParent();
+        if (!parent) {
+            return;
+        }
+
+        const validIds = new Set<string>();
+        for (const state of states) {
+            const id = String(state.id || '');
+            if (!id) {
+                continue;
+            }
+            validIds.add(id);
+
+            let enemyNode = this._replicatedEnemies.get(id) || null;
+            if (!enemyNode || !enemyNode.isValid) {
+                enemyNode = this.findActiveEnemyByNetId(id);
+                if (enemyNode) {
+                    this._replicatedEnemies.set(id, enemyNode);
+                }
+            }
+            if (!enemyNode || !enemyNode.isValid) {
+                enemyNode =
+                    this._enemyPool.size() > 0
+                        ? this._enemyPool.get()!
+                        : instantiate(this.enemyPrefab);
+                enemyNode.name = this.enemyName;
+                enemyNode.active = true;
+                enemyNode.setParent(parent);
+                this.setEnemyNetId(enemyNode, id);
+                this.configureEnemy(enemyNode, false);
+                this._replicatedEnemies.set(id, enemyNode);
+                if (this._activeEnemies.indexOf(enemyNode) < 0) {
+                    this._activeEnemies.push(enemyNode);
+                }
+                enemyNode.setWorldPosition(state.x, state.y, state.z);
+            }
+
+            const targetPos = this._replicatedTargetPos.get(id) || new Vec3();
+            targetPos.set(state.x, state.y, state.z);
+            this._replicatedTargetPos.set(id, targetPos);
+        }
+
+        for (const [id, enemyNode] of this._replicatedEnemies) {
+            if (!validIds.has(id)) {
+                this._replicatedEnemies.delete(id);
+                this._replicatedTargetPos.delete(id);
+                this.recycleEnemy(enemyNode);
+            }
+        }
+    }
+
+    private cleanupForReplicaMode() {
+        const allEnemies = this._activeEnemies.slice();
+        this._replicatedEnemies.clear();
+        this._replicatedTargetPos.clear();
+        for (const enemy of allEnemies) {
+            if (!enemy || !enemy.isValid) {
+                continue;
+            }
+            this.recycleEnemy(enemy);
+        }
+        this._activeEnemies.length = 0;
+    }
+
+    private updateReplicaEnemyVisuals(dt: number) {
+        if (dt <= 0) {
+            return;
+        }
+        const interpolation = Math.min(
+            1,
+            Math.max(0, dt * Math.max(0.1, this.enemyInterpolationSpeed)),
+        );
+        for (const [id, enemyNode] of this._replicatedEnemies) {
+            if (!enemyNode || !enemyNode.isValid || !enemyNode.activeInHierarchy) {
+                continue;
+            }
+            const targetPos = this._replicatedTargetPos.get(id);
+            if (!targetPos) {
+                continue;
+            }
+
+            enemyNode.getWorldPosition(this._enemyVisualPos);
+            Vec3.lerp(this._enemyVisualPos, this._enemyVisualPos, targetPos, interpolation);
+            enemyNode.setWorldPosition(this._enemyVisualPos);
+        }
+    }
+
     private compactActiveEnemies() {
         for (let i = this._activeEnemies.length - 1; i >= 0; i--) {
             const node = this._activeEnemies[i];
@@ -140,13 +379,14 @@ export class EnemySystem extends Component {
         }
     }
 
-    // 低频触发全量同步，避免计数因外部销毁而漂移。
     private shouldSyncSceneEnemies(): boolean {
-        const syncEveryCalls = Math.max(1, Math.ceil(30 / Math.max(0.1, this.spawnIntervalSeconds)));
+        const syncEveryCalls = Math.max(
+            1,
+            Math.ceil(30 / Math.max(0.1, this.spawnIntervalSeconds)),
+        );
         return this._generateCallCount % syncEveryCalls === 0;
     }
 
-    // 使用场景扫描结果校准活动敌人列表。
     private syncActiveEnemiesFromScene() {
         const sceneEnemies = this.collectSceneEnemies();
         this._activeEnemies.length = 0;
@@ -155,23 +395,43 @@ export class EnemySystem extends Component {
         }
     }
 
-    // 配置单个敌人的追踪技能参数。
-    private configureEnemy(enemyNode: Node) {
+    private refreshAllEnemyConfigs() {
+        for (const enemy of this._activeEnemies) {
+            if (!enemy || !enemy.isValid) {
+                continue;
+            }
+            this.ensureEnemyNetId(enemy);
+            this.configureEnemy(enemy, this.isAuthoritative());
+        }
+    }
+
+    private configureEnemy(enemyNode: Node, enableLogic: boolean) {
         const enemyComp = enemyNode.getComponent(Enemy);
         if (!enemyComp) {
             return;
         }
+
         let chaseComp = enemyNode.getComponent(ChasePlayer);
         if (!chaseComp) {
             chaseComp = enemyNode.addComponent(ChasePlayer);
         }
 
-        chaseComp.target = this.player;
-        chaseComp.moveSpeed = Math.max(0, this.moveSpeed);
-        chaseComp.stopDistance = Math.max(0, this.stopDistance);
+        const eatComp = enemyNode.getComponent(Eat);
+
+        chaseComp.enabled = enableLogic;
+        if (eatComp) {
+            eatComp.enabled = enableLogic;
+        }
+
+        if (enableLogic) {
+            chaseComp.target = this.player;
+            chaseComp.moveSpeed = Math.max(0, this.moveSpeed);
+            chaseComp.stopDistance = Math.max(0, this.stopDistance);
+        } else {
+            chaseComp.target = null;
+        }
     }
 
-    // 清空单个敌人的追踪目标引用。
     private clearEnemyTarget(enemyNode: Node) {
         const chaseComp = enemyNode.getComponent(ChasePlayer);
         if (!chaseComp) {
@@ -180,7 +440,6 @@ export class EnemySystem extends Component {
         chaseComp.target = null;
     }
 
-    // 在未绑定玩家时自动查找名为 Player 的节点。
     private resolvePlayer() {
         if (this.player && this.player.isValid) {
             return;
@@ -194,7 +453,6 @@ export class EnemySystem extends Component {
         this.player = this.findNodeByName(scene, 'Player');
     }
 
-    // 解析敌人生成父节点并提供安全回退。
     private resolveSpawnParent(): Node | null {
         const scene = director.getScene();
         if (!scene) {
@@ -208,7 +466,6 @@ export class EnemySystem extends Component {
         return scene;
     }
 
-    // 计算敌人在玩家周围的随机出生世界坐标。
     private computeSpawnWorldPosition(out: Vec3) {
         const minRadius = Math.max(0, this.spawnMinRadius);
         const maxRadius = Math.max(minRadius, this.spawnMaxRadius);
@@ -228,7 +485,6 @@ export class EnemySystem extends Component {
         );
     }
 
-    // 收集当前场景中符合条件的敌人节点。
     private collectSceneEnemies(): Node[] {
         this._sceneEnemies.length = 0;
         const scene = director.getScene();
@@ -244,7 +500,6 @@ export class EnemySystem extends Component {
         return this._sceneEnemies;
     }
 
-    // 判断节点是否应计入敌人统计。
     private isSceneEnemyNode(node: Node): boolean {
         if (!node || !node.isValid || !node.activeInHierarchy) {
             return false;
@@ -258,7 +513,6 @@ export class EnemySystem extends Component {
         return node.name === this.enemyName;
     }
 
-    // 递归按名称查找节点。
     private findNodeByName(root: Node, targetName: string): Node | null {
         if (root.name === targetName) {
             return root;
@@ -273,7 +527,6 @@ export class EnemySystem extends Component {
         return null;
     }
 
-    // 深度优先遍历节点树并执行访问回调。
     private walkTree(root: Node, visitor: (node: Node) => void) {
         visitor(root);
         for (const child of root.children) {
@@ -281,4 +534,35 @@ export class EnemySystem extends Component {
         }
     }
 
+    private setEnemyNetId(enemyNode: Node, id: string) {
+        const netEnemyNode = enemyNode as EnemyNodeWithNetId;
+        netEnemyNode[NET_ENEMY_ID_KEY] = id;
+    }
+
+    private getEnemyNetId(enemyNode: Node): string {
+        const netEnemyNode = enemyNode as EnemyNodeWithNetId;
+        return String(netEnemyNode[NET_ENEMY_ID_KEY] || '');
+    }
+
+    private ensureEnemyNetId(enemyNode: Node): string {
+        const existed = this.getEnemyNetId(enemyNode);
+        if (existed) {
+            return existed;
+        }
+        const id = `e-${this._enemyIdCounter++}`;
+        this.setEnemyNetId(enemyNode, id);
+        return id;
+    }
+
+    private findActiveEnemyByNetId(id: string): Node | null {
+        for (const enemy of this._activeEnemies) {
+            if (!enemy || !enemy.isValid) {
+                continue;
+            }
+            if (this.getEnemyNetId(enemy) === id) {
+                return enemy;
+            }
+        }
+        return null;
+    }
 }

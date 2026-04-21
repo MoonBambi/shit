@@ -1,5 +1,7 @@
 import { _decorator, Component, director, Node, Prefab, Vec3, v3 } from 'cc';
 import { Enemy } from '../../Enemy';
+import { NetClient } from '../../Net/NetClient';
+import { FoodItem } from '../Food/FoodItem';
 import { ChasePlayer } from './ChasePlayer';
 import { FoodRegistry } from '../Food/FoodRegistry';
 const { ccclass, property } = _decorator;
@@ -97,6 +99,17 @@ export class Eat extends Component {
         const reachDistance = stopDistance + Math.max(0, this.reachEpsilon);
         if (distance <= reachDistance || distance <= 0.0001) {
             if (foodNode.isValid) {
+                const netClient = NetClient.getInstance();
+                const castId = NetClient.getSkillCastId(foodNode);
+                if (castId) {
+                    netClient?.sendSkillDestroy(castId);
+                } else {
+                    const foodItem = foodNode.getComponent(FoodItem);
+                    const foodId = foodItem ? foodItem.getFoodId() : '';
+                    if (foodId) {
+                        netClient?.sendFoodDestroy(foodId);
+                    }
+                }
                 foodNode.destroy();
             }
             if (this._enemy) {

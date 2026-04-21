@@ -7,17 +7,20 @@ import {
     instantiate,
     KeyCode,
     Prefab,
+    Vec3,
 } from 'cc';
+import { NetClient } from '../../Net/NetClient';
 const { ccclass, property } = _decorator;
 
 @ccclass('PlayerSkillCaster')
 export class PlayerSkillCaster extends Component {
-    private static readonly SKILL_LIFETIME_SECONDS = 180;
+    private static readonly EXCRETION_LIFETIME_SECONDS = 180;
 
-    @property({ type: Prefab, tooltip: 'Spawn prefab when pressing J.' })
-    public skillPrefab: Prefab | null = null;
+    @property({ type: Prefab, tooltip: '按 J 生成排便预制体。' })
+    public excretionPrefab: Prefab | null = null;
 
-    private _isSkillKeyPressed: boolean = false;
+    private _isExcretionKeyPressed: boolean = false;
+    private readonly _castWorldPos: Vec3 = new Vec3();
 
     onEnable() {
         input.on(Input.EventType.KEY_DOWN, this.onKeyDown, this);
@@ -27,7 +30,7 @@ export class PlayerSkillCaster extends Component {
     onDisable() {
         input.off(Input.EventType.KEY_DOWN, this.onKeyDown, this);
         input.off(Input.EventType.KEY_UP, this.onKeyUp, this);
-        this._isSkillKeyPressed = false;
+        this._isExcretionKeyPressed = false;
     }
 
     private onKeyDown(event: EventKeyboard) {
@@ -35,23 +38,23 @@ export class PlayerSkillCaster extends Component {
             return;
         }
 
-        if (this._isSkillKeyPressed) {
+        if (this._isExcretionKeyPressed) {
             return;
         }
 
-        this._isSkillKeyPressed = true;
-        this.castSkill();
+        this._isExcretionKeyPressed = true;
+        this.castExcretion();
     }
 
     private onKeyUp(event: EventKeyboard) {
         if (event.keyCode === KeyCode.KEY_J) {
-            this._isSkillKeyPressed = false;
+            this._isExcretionKeyPressed = false;
         }
     }
 
-    private castSkill() {
-        if (!this.skillPrefab) {
-            console.warn('[PlayerSkillCaster] skillPrefab is not assigned.');
+    private castExcretion() {
+        if (!this.excretionPrefab) {
+            console.warn('[PlayerSkillCaster] excretionPrefab is not assigned.');
             return;
         }
 
@@ -61,14 +64,33 @@ export class PlayerSkillCaster extends Component {
             return;
         }
 
-        const skillInstance = instantiate(this.skillPrefab);
-        skillInstance.setPosition(this.node.position);
-        parent.addChild(skillInstance);
+        const netClient = NetClient.getInstance();
+        if (netClient && netClient.isConnected() && !netClient.isGameStarted()) {
+            return;
+        }
+
+        this.node.getWorldPosition(this._castWorldPos);
+
+        const excretionInstance = instantiate(this.excretionPrefab);
+        parent.addChild(excretionInstance);
+        excretionInstance.setWorldPosition(this._castWorldPos);
+        const castId = netClient?.sendSkillCast(
+            'excretion',
+            this._castWorldPos,
+            PlayerSkillCaster.EXCRETION_LIFETIME_SECONDS,
+        );
+        if (castId) {
+            NetClient.setSkillCastId(excretionInstance, castId);
+            netClient?.registerSkillNode(castId, excretionInstance);
+        }
 
         this.scheduleOnce(() => {
-            if (skillInstance.isValid) {
-                skillInstance.destroy();
+            if (excretionInstance.isValid) {
+                excretionInstance.destroy();
             }
-        }, PlayerSkillCaster.SKILL_LIFETIME_SECONDS);
+            if (castId) {
+                netClient?.unregisterSkillNode(castId);
+            }
+        }, PlayerSkillCaster.EXCRETION_LIFETIME_SECONDS);
     }
 }

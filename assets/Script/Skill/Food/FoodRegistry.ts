@@ -1,10 +1,12 @@
 import { _decorator, Component, director, Node } from 'cc';
+import { FoodItem } from './FoodItem';
 const { ccclass } = _decorator;
 
 @ccclass('FoodRegistry')
 export class FoodRegistry extends Component {
     private static _instance: FoodRegistry | null = null;
     private readonly _foods: Set<Node> = new Set<Node>();
+    private readonly _foodById: Map<string, FoodItem> = new Map();
 
     // 初始化并记录场景中的唯一注册表实例。
     onLoad() {
@@ -17,27 +19,39 @@ export class FoodRegistry extends Component {
             FoodRegistry._instance = null;
         }
         this._foods.clear();
+        this._foodById.clear();
     }
 
     // 注册一个可被敌人检索的食物节点。
-    public static register(food: Node) {
-        if (!food || !food.isValid) {
+    public static register(foodItem: FoodItem) {
+        if (!foodItem || !foodItem.isValid) {
             return;
         }
         const registry = this.ensureInstance();
         if (!registry) {
             return;
         }
-        registry._foods.add(food);
+        const foodNode = foodItem.node;
+        const foodId = foodItem.getFoodId();
+        if (foodNode && foodNode.isValid) {
+            registry._foods.add(foodNode);
+        }
+        if (foodId) {
+            registry._foodById.set(foodId, foodItem);
+        }
     }
 
     // 注销一个食物节点。
-    public static unregister(food: Node) {
+    public static unregister(foodItem: FoodItem) {
         const registry = this._instance;
-        if (!registry || !food) {
+        if (!registry || !foodItem) {
             return;
         }
-        registry._foods.delete(food);
+        registry._foods.delete(foodItem.node);
+        const foodId = foodItem.getFoodId();
+        if (foodId) {
+            registry._foodById.delete(foodId);
+        }
     }
 
     // 获取当前有效食物列表快照。
@@ -50,11 +64,42 @@ export class FoodRegistry extends Component {
         return Array.from(registry._foods);
     }
 
+    // 根据 foodId 获取有效食物节点。
+    public static getFoodById(foodId: string): Node | null {
+        const registry = this._instance;
+        if (!registry) {
+            return null;
+        }
+        const normalizedId = String(foodId || '');
+        if (!normalizedId) {
+            return null;
+        }
+        const foodItem = registry._foodById.get(normalizedId);
+        if (!foodItem || !foodItem.isValid) {
+            return null;
+        }
+        const foodNode = foodItem.node;
+        if (!foodNode || !foodNode.isValid || !foodNode.activeInHierarchy) {
+            return null;
+        }
+        return foodNode;
+    }
+
     // 移除已失效的食物节点，防止列表长期累积脏数据。
     private pruneInvalidFoods() {
         for (const food of this._foods) {
             if (!food || !food.isValid || !food.activeInHierarchy) {
                 this._foods.delete(food);
+            }
+        }
+        for (const [foodId, foodItem] of this._foodById) {
+            if (!foodItem || !foodItem.isValid) {
+                this._foodById.delete(foodId);
+                continue;
+            }
+            const foodNode = foodItem.node;
+            if (!foodNode || !foodNode.isValid || !foodNode.activeInHierarchy) {
+                this._foodById.delete(foodId);
             }
         }
     }
@@ -76,7 +121,8 @@ export class FoodRegistry extends Component {
             scene.addChild(registryNode);
         }
 
-        const registry = registryNode.getComponent(FoodRegistry) || registryNode.addComponent(FoodRegistry);
+        const registry =
+            registryNode.getComponent(FoodRegistry) || registryNode.addComponent(FoodRegistry);
         this._instance = registry;
         return registry;
     }
