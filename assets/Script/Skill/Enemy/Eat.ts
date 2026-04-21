@@ -23,6 +23,9 @@ export class Eat extends Component {
     @property({ tooltip: '分片查询数（越大同帧查询敌人越少）。' })
     public querySlice: number = 5;
 
+    @property({ tooltip: '到达判定容差（解决边界卡住）。' })
+    public reachEpsilon: number = 0.2;
+
     private readonly _enemyPos: Vec3 = v3();
     private readonly _foodPos: Vec3 = v3();
     private readonly _direction: Vec3 = v3();
@@ -89,7 +92,8 @@ export class Eat extends Component {
 
         const distance = this._direction.length();
         const stopDistance = Math.max(0, this.stopDistance);
-        if (distance <= stopDistance || distance <= 0.0001) {
+        const reachDistance = stopDistance + Math.max(0, this.reachEpsilon);
+        if (distance <= reachDistance || distance <= 0.0001) {
             if (foodNode.isValid) {
                 foodNode.destroy();
             }

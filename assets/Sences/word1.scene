@@ -187,7 +187,7 @@
     "_priority": 0,
     "_fov": 45,
     "_fovAxis": 0,
-    "_orthoHeight": 481.1764705882353,
+    "_orthoHeight": 482.3529411764706,
     "_near": 0,
     "_far": 2000,
     "_color": {
@@ -856,7 +856,7 @@
     },
     "enemyName": "Enemy",
     "spawnIntervalSeconds": 5,
-    "maxEnemyCount": 20,
+    "maxEnemyCount": 1,
     "spawnMinRadius": 180,
     "spawnMaxRadius": 420,
     "moveSpeed": 120,
