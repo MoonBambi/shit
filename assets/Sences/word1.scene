@@ -155,8 +155,8 @@
     "_prefab": null,
     "_lpos": {
       "__type__": "cc.Vec3",
-      "x": -138.776,
-      "y": -9.264999999999986,
+      "x": -146.299,
+      "y": 49.972,
       "z": 0
     },
     "_lrot": {
@@ -256,8 +256,8 @@
     "_prefab": null,
     "_lpos": {
       "__type__": "cc.Vec3",
-      "x": -66.202,
-      "y": -0.348,
+      "x": -73.725,
+      "y": 58.889,
       "z": 0
     },
     "_lrot": {
@@ -533,8 +533,8 @@
     "_prefab": null,
     "_lpos": {
       "__type__": "cc.Vec3",
-      "x": 0,
-      "y": 0,
+      "x": -7.523,
+      "y": 59.237,
       "z": 0
     },
     "_lrot": {
@@ -782,8 +782,8 @@
     ],
     "value": {
       "__type__": "cc.Vec3",
-      "x": -62.29286889542209,
-      "y": -82.9617052560672,
+      "x": -69.815,
+      "y": -23.725,
       "z": 0
     }
   },
@@ -912,8 +912,8 @@
     ],
     "value": {
       "__type__": "cc.Vec3",
-      "x": 38.47500725893735,
-      "y": -86.6259916616803,
+      "x": 30.952,
+      "y": -27.389,
       "z": 0
     }
   },
@@ -1042,8 +1042,8 @@
     ],
     "value": {
       "__type__": "cc.Vec3",
-      "x": 130.08216739926434,
-      "y": -84.79384845887375,
+      "x": 122.56,
+      "y": -25.557,
       "z": 0
     }
   },
@@ -1131,8 +1131,8 @@
     "_prefab": null,
     "_lpos": {
       "__type__": "cc.Vec3",
-      "x": -138.776,
-      "y": -9.265,
+      "x": -146.299,
+      "y": 49.972,
       "z": 0
     },
     "_lrot": {
@@ -1199,11 +1199,16 @@
     },
     "enemyName": "Enemy",
     "spawnIntervalSeconds": 5,
-    "maxEnemyCount": 1,
+    "maxEnemyCount": 2,
     "spawnMinRadius": 180,
     "spawnMaxRadius": 420,
     "moveSpeed": 120,
     "stopDistance": 16,
+    "chaseRange": 260,
+    "wanderMoveSpeed": 80,
+    "wanderStopDistance": 6,
+    "wanderWidth": 800,
+    "wanderHeight": 600,
     "isNetworkAuthority": true,
     "enemySyncIntervalSeconds": 0.1,
     "enemyInterpolationSpeed": 14,

@@ -37,6 +37,11 @@
 
 - `PlayerSkillCaster.ts`：玩家按键施法组件（按 J 生成技能对象）。
 
+#### `assets/Script/Net`
+
+- `NetClient.ts`：客户端联机通信组件（连接、消息收发、状态同步）。
+- `EnemyNetReplicator.ts`：敌人网络复制组件（权威判定、快照同步、客机插值）。
+
 ### `assets/Sences`
 
 - `word1.scene`：当前主场景资源文件。

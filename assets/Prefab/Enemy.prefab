@@ -266,6 +266,7 @@
     "target": null,
     "moveSpeed": 100,
     "stopDistance": 24,
+    "chaseRange": 50,
     "_id": ""
   },
   {
@@ -292,6 +293,7 @@
     },
     "cd": 0,
     "querySlice": 5,
+    "reachEpsilon": 0.2,
     "_id": ""
   },
   {

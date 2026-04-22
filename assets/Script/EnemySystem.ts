@@ -11,9 +11,10 @@ import {
     v3,
 } from 'cc';
 import { Enemy } from './Enemy';
-import { NetClient, EnemyNetState } from './Net/NetClient';
+import { EnemyNetReplicator } from './Net/EnemyNetReplicator';
 import { ChasePlayer } from './Skill/Enemy/ChasePlayer';
 import { Eat } from './Skill/Enemy/Eat';
+import { Wander } from './Skill/Enemy/Wander';
 const { ccclass, property } = _decorator;
 
 const NET_ENEMY_ID_KEY = '__netEnemyId';
@@ -48,6 +49,21 @@ export class EnemySystem extends Component {
     @property({ tooltip: 'Enemy stop distance to target.' })
     public stopDistance: number = 16;
 
+    @property({ tooltip: 'Enemy chase range to player.' })
+    public chaseRange: number = 260;
+
+    @property({ tooltip: 'Enemy wander speed when no player in chase range.' })
+    public wanderMoveSpeed: number = 80;
+
+    @property({ tooltip: 'Enemy wander stop distance.' })
+    public wanderStopDistance: number = 6;
+
+    @property({ tooltip: 'Enemy wander rectangle width from world-origin lower-left.' })
+    public wanderWidth: number = 800;
+
+    @property({ tooltip: 'Enemy wander rectangle height from world-origin lower-left.' })
+    public wanderHeight: number = 600;
+
     @property({ tooltip: 'Whether this client can simulate enemy spawn and AI.' })
     public isNetworkAuthority: boolean = true;
 
@@ -62,70 +78,32 @@ export class EnemySystem extends Component {
     private readonly _sceneEnemies: Node[] = [];
     private readonly _spawnCenter: Vec3 = v3();
     private readonly _spawnWorldPos: Vec3 = v3();
-    private readonly _enemyVisualPos: Vec3 = v3();
-    private readonly _snapshotBuffer: EnemyNetState[] = [];
-    private readonly _replicatedEnemies: Map<string, Node> = new Map();
-    private readonly _replicatedTargetPos: Map<string, Vec3> = new Map();
-
-    private _netClient: NetClient | null = null;
     private _generateCallCount: number = 0;
     private _enemyIdCounter: number = 1;
-    private _runtimeAuthority: boolean = false;
-    private _snapshotListenerAttached: boolean = false;
-
-    private readonly _onEnemySnapshot = (states: EnemyNetState[]) => {
-        this.applyEnemySnapshot(states);
-    };
 
     onEnable() {
-        this._netClient = NetClient.getInstance();
         this.resolvePlayer();
         this.syncActiveEnemiesFromScene();
-        this.refreshNetworkMode(true);
+        this.applyLogicToActiveEnemies(this.canSimulateAi());
+        if (!this.hasNetReplicator()) {
+            this.schedule(this.generate, Math.max(0.1, this.spawnIntervalSeconds));
+            this.generate();
+        }
     }
 
     onDisable() {
         this.unschedule(this.generate);
-        this.unschedule(this.syncEnemySnapshot);
-        this.detachSnapshotListener();
     }
 
     onDestroy() {
-        this.onDisable();
+        this.unschedule(this.generate);
         this._activeEnemies.length = 0;
         this._sceneEnemies.length = 0;
-        this._snapshotBuffer.length = 0;
-        this._replicatedEnemies.clear();
-        this._replicatedTargetPos.clear();
         this._enemyPool.clear();
     }
 
-    update(dt: number) {
-        const latestNet = NetClient.getInstance();
-        if (latestNet !== this._netClient) {
-            this.detachSnapshotListener();
-            this._netClient = latestNet;
-            this.refreshNetworkMode(true);
-            return;
-        }
-
-        const authority = this.isAuthoritative();
-        if (authority !== this._runtimeAuthority) {
-            this.refreshNetworkMode(true);
-            return;
-        }
-
-        if (!authority) {
-            this.updateReplicaEnemyVisuals(dt);
-        }
-
-        if (!authority && !this._snapshotListenerAttached && this._netClient) {
-            this.attachSnapshotListener();
-        }
-    }
-
     public generate() {
-        if (!this.isAuthoritative()) {
+        if (!this.canSimulateAi()) {
             return;
         }
 
@@ -134,7 +112,7 @@ export class EnemySystem extends Component {
         this._generateCallCount++;
         if (this.shouldSyncSceneEnemies()) {
             this.syncActiveEnemiesFromScene();
-            this.refreshAllEnemyConfigs();
+            this.applyLogicToActiveEnemies(this.canSimulateAi());
         }
 
         const maxCount = Math.max(1, Math.floor(this.maxEnemyCount));
@@ -146,11 +124,7 @@ export class EnemySystem extends Component {
     }
 
     public spawnEnemy() {
-        if (!this.isAuthoritative()) {
-            return;
-        }
-        if (!this.enemyPrefab) {
-            console.warn('[EnemySystem] enemyPrefab is not assigned.');
+        if (!this.canSimulateAi()) {
             return;
         }
 
@@ -160,20 +134,16 @@ export class EnemySystem extends Component {
             return;
         }
 
-        const enemyNode =
-            this._enemyPool.size() > 0 ? this._enemyPool.get()! : instantiate(this.enemyPrefab);
-        enemyNode.name = this.enemyName;
-        enemyNode.setParent(parent);
+        const enemyNode = this.acquireEnemyNode(parent);
+        if (!enemyNode) {
+            return;
+        }
         this.computeSpawnWorldPosition(this._spawnWorldPos);
         enemyNode.setWorldPosition(this._spawnWorldPos);
-        enemyNode.active = true;
 
         this.ensureEnemyNetId(enemyNode);
         this.configureEnemy(enemyNode, true);
-
-        if (this._activeEnemies.indexOf(enemyNode) < 0) {
-            this._activeEnemies.push(enemyNode);
-        }
+        this.registerActiveEnemy(enemyNode);
     }
 
     public recycleEnemy(enemyNode: Node) {
@@ -187,157 +157,8 @@ export class EnemySystem extends Component {
         this._enemyPool.put(enemyNode);
     }
 
-    private isAuthoritative(): boolean {
-        const net = this._netClient || NetClient.getInstance();
-        if (!net || !net.isConnected()) {
-            return this.isNetworkAuthority;
-        }
-        if (!net.isGameStarted()) {
-            return false;
-        }
-        return this.isNetworkAuthority && net.isHost();
-    }
-
-    private refreshNetworkMode(force: boolean = false) {
-        const authority = this.isAuthoritative();
-        const previousAuthority = this._runtimeAuthority;
-        if (!force && authority === this._runtimeAuthority) {
-            return;
-        }
-        this._runtimeAuthority = authority;
-
-        this.resolvePlayer();
-        this.refreshAllEnemyConfigs();
-
-        this.unschedule(this.generate);
-        this.unschedule(this.syncEnemySnapshot);
-
-        if (authority) {
-            this.detachSnapshotListener();
-            this.schedule(this.generate, Math.max(0.1, this.spawnIntervalSeconds));
-            this.schedule(this.syncEnemySnapshot, Math.max(0.05, this.enemySyncIntervalSeconds));
-            this.generate();
-            return;
-        }
-
-        if (previousAuthority || force) {
-            this.cleanupForReplicaMode();
-        }
-        this.attachSnapshotListener();
-    }
-
-    private attachSnapshotListener() {
-        if (!this._netClient || this._snapshotListenerAttached) {
-            return;
-        }
-        this._netClient.onEnemySnapshot(this._onEnemySnapshot);
-        this._snapshotListenerAttached = true;
-    }
-
-    private detachSnapshotListener() {
-        if (!this._snapshotListenerAttached) {
-            return;
-        }
-        if (this._netClient) {
-            this._netClient.offEnemySnapshot(this._onEnemySnapshot);
-        }
-        this._snapshotListenerAttached = false;
-    }
-
-    private syncEnemySnapshot() {
-        if (!this.isAuthoritative()) {
-            return;
-        }
-
-        const net = this._netClient || NetClient.getInstance();
-        if (!net || !net.isConnected() || !net.isHost()) {
-            return;
-        }
-
-        this.compactActiveEnemies();
-        this._snapshotBuffer.length = 0;
-
-        for (const enemy of this._activeEnemies) {
-            if (!enemy || !enemy.isValid || !enemy.activeInHierarchy) {
-                continue;
-            }
-
-            const enemyId = this.ensureEnemyNetId(enemy);
-            enemy.getWorldPosition(this._spawnWorldPos);
-            this._snapshotBuffer.push({
-                id: enemyId,
-                x: this._spawnWorldPos.x,
-                y: this._spawnWorldPos.y,
-                z: this._spawnWorldPos.z,
-            });
-        }
-
-        net.sendEnemySnapshot(this._snapshotBuffer);
-    }
-
-    private applyEnemySnapshot(states: EnemyNetState[]) {
-        if (this.isAuthoritative()) {
-            return;
-        }
-        if (!this.enemyPrefab) {
-            return;
-        }
-
-        const parent = this.resolveSpawnParent();
-        if (!parent) {
-            return;
-        }
-
-        const validIds = new Set<string>();
-        for (const state of states) {
-            const id = String(state.id || '');
-            if (!id) {
-                continue;
-            }
-            validIds.add(id);
-
-            let enemyNode = this._replicatedEnemies.get(id) || null;
-            if (!enemyNode || !enemyNode.isValid) {
-                enemyNode = this.findActiveEnemyByNetId(id);
-                if (enemyNode) {
-                    this._replicatedEnemies.set(id, enemyNode);
-                }
-            }
-            if (!enemyNode || !enemyNode.isValid) {
-                enemyNode =
-                    this._enemyPool.size() > 0
-                        ? this._enemyPool.get()!
-                        : instantiate(this.enemyPrefab);
-                enemyNode.name = this.enemyName;
-                enemyNode.active = true;
-                enemyNode.setParent(parent);
-                this.setEnemyNetId(enemyNode, id);
-                this.configureEnemy(enemyNode, false);
-                this._replicatedEnemies.set(id, enemyNode);
-                if (this._activeEnemies.indexOf(enemyNode) < 0) {
-                    this._activeEnemies.push(enemyNode);
-                }
-                enemyNode.setWorldPosition(state.x, state.y, state.z);
-            }
-
-            const targetPos = this._replicatedTargetPos.get(id) || new Vec3();
-            targetPos.set(state.x, state.y, state.z);
-            this._replicatedTargetPos.set(id, targetPos);
-        }
-
-        for (const [id, enemyNode] of this._replicatedEnemies) {
-            if (!validIds.has(id)) {
-                this._replicatedEnemies.delete(id);
-                this._replicatedTargetPos.delete(id);
-                this.recycleEnemy(enemyNode);
-            }
-        }
-    }
-
-    private cleanupForReplicaMode() {
+    public cleanupForReplicaMode() {
         const allEnemies = this._activeEnemies.slice();
-        this._replicatedEnemies.clear();
-        this._replicatedTargetPos.clear();
         for (const enemy of allEnemies) {
             if (!enemy || !enemy.isValid) {
                 continue;
@@ -347,30 +168,7 @@ export class EnemySystem extends Component {
         this._activeEnemies.length = 0;
     }
 
-    private updateReplicaEnemyVisuals(dt: number) {
-        if (dt <= 0) {
-            return;
-        }
-        const interpolation = Math.min(
-            1,
-            Math.max(0, dt * Math.max(0.1, this.enemyInterpolationSpeed)),
-        );
-        for (const [id, enemyNode] of this._replicatedEnemies) {
-            if (!enemyNode || !enemyNode.isValid || !enemyNode.activeInHierarchy) {
-                continue;
-            }
-            const targetPos = this._replicatedTargetPos.get(id);
-            if (!targetPos) {
-                continue;
-            }
-
-            enemyNode.getWorldPosition(this._enemyVisualPos);
-            Vec3.lerp(this._enemyVisualPos, this._enemyVisualPos, targetPos, interpolation);
-            enemyNode.setWorldPosition(this._enemyVisualPos);
-        }
-    }
-
-    private compactActiveEnemies() {
+    public compactActiveEnemies() {
         for (let i = this._activeEnemies.length - 1; i >= 0; i--) {
             const node = this._activeEnemies[i];
             if (!node || !node.isValid) {
@@ -395,17 +193,18 @@ export class EnemySystem extends Component {
         }
     }
 
-    private refreshAllEnemyConfigs() {
+    public applyLogicToActiveEnemies(enableLogic: boolean) {
+        this.resolvePlayer();
         for (const enemy of this._activeEnemies) {
             if (!enemy || !enemy.isValid) {
                 continue;
             }
             this.ensureEnemyNetId(enemy);
-            this.configureEnemy(enemy, this.isAuthoritative());
+            this.configureEnemy(enemy, enableLogic);
         }
     }
 
-    private configureEnemy(enemyNode: Node, enableLogic: boolean) {
+    public configureEnemy(enemyNode: Node, enableLogic: boolean) {
         const enemyComp = enemyNode.getComponent(Enemy);
         if (!enemyComp) {
             return;
@@ -415,10 +214,15 @@ export class EnemySystem extends Component {
         if (!chaseComp) {
             chaseComp = enemyNode.addComponent(ChasePlayer);
         }
+        let wanderComp = enemyNode.getComponent(Wander);
+        if (!wanderComp) {
+            wanderComp = enemyNode.addComponent(Wander);
+        }
 
         const eatComp = enemyNode.getComponent(Eat);
 
         chaseComp.enabled = enableLogic;
+        wanderComp.enabled = enableLogic;
         if (eatComp) {
             eatComp.enabled = enableLogic;
         }
@@ -427,9 +231,58 @@ export class EnemySystem extends Component {
             chaseComp.target = this.player;
             chaseComp.moveSpeed = Math.max(0, this.moveSpeed);
             chaseComp.stopDistance = Math.max(0, this.stopDistance);
+            chaseComp.chaseRange = Math.max(0, this.chaseRange);
+            wanderComp.moveSpeed = Math.max(0, this.wanderMoveSpeed);
+            wanderComp.stopDistance = Math.max(0, this.wanderStopDistance);
+            wanderComp.width = Math.max(0, this.wanderWidth);
+            wanderComp.height = Math.max(0, this.wanderHeight);
         } else {
             chaseComp.target = null;
         }
+    }
+
+    public acquireEnemyNode(parent: Node): Node | null {
+        if (!this.enemyPrefab) {
+            console.warn('[EnemySystem] enemyPrefab is not assigned.');
+            return null;
+        }
+        const enemyNode =
+            this._enemyPool.size() > 0 ? this._enemyPool.get()! : instantiate(this.enemyPrefab);
+        enemyNode.name = this.enemyName;
+        enemyNode.setParent(parent);
+        enemyNode.active = true;
+        return enemyNode;
+    }
+
+    public registerActiveEnemy(enemyNode: Node) {
+        if (this._activeEnemies.indexOf(enemyNode) < 0) {
+            this._activeEnemies.push(enemyNode);
+        }
+    }
+
+    public getActiveEnemies(): Node[] {
+        return this._activeEnemies;
+    }
+
+    public canSimulateAi(): boolean {
+        const replicator = this.getNetReplicator();
+        if (replicator && replicator.enabledInHierarchy) {
+            return replicator.isAuthoritative();
+        }
+        return this.isNetworkAuthority;
+    }
+
+    public resolveSpawnParent(): Node | null {
+        const scene = director.getScene();
+        if (!scene) {
+            return this.node && this.node.isValid ? this.node : null;
+        }
+
+        if (this.node && this.node.parent && this.node.parent.isValid) {
+            return this.node.parent;
+        }
+
+        return scene;
     }
 
     private clearEnemyTarget(enemyNode: Node) {
@@ -451,19 +304,6 @@ export class EnemySystem extends Component {
         }
 
         this.player = this.findNodeByName(scene, 'Player');
-    }
-
-    private resolveSpawnParent(): Node | null {
-        const scene = director.getScene();
-        if (!scene) {
-            return this.node && this.node.isValid ? this.node : null;
-        }
-
-        if (this.node && this.node.parent && this.node.parent.isValid) {
-            return this.node.parent;
-        }
-
-        return scene;
     }
 
     private computeSpawnWorldPosition(out: Vec3) {
@@ -534,17 +374,17 @@ export class EnemySystem extends Component {
         }
     }
 
-    private setEnemyNetId(enemyNode: Node, id: string) {
+    public setEnemyNetId(enemyNode: Node, id: string) {
         const netEnemyNode = enemyNode as EnemyNodeWithNetId;
         netEnemyNode[NET_ENEMY_ID_KEY] = id;
     }
 
-    private getEnemyNetId(enemyNode: Node): string {
+    public getEnemyNetId(enemyNode: Node): string {
         const netEnemyNode = enemyNode as EnemyNodeWithNetId;
         return String(netEnemyNode[NET_ENEMY_ID_KEY] || '');
     }
 
-    private ensureEnemyNetId(enemyNode: Node): string {
+    public ensureEnemyNetId(enemyNode: Node): string {
         const existed = this.getEnemyNetId(enemyNode);
         if (existed) {
             return existed;
@@ -554,7 +394,7 @@ export class EnemySystem extends Component {
         return id;
     }
 
-    private findActiveEnemyByNetId(id: string): Node | null {
+    public findActiveEnemyByNetId(id: string): Node | null {
         for (const enemy of this._activeEnemies) {
             if (!enemy || !enemy.isValid) {
                 continue;
@@ -564,5 +404,13 @@ export class EnemySystem extends Component {
             }
         }
         return null;
+    }
+
+    private hasNetReplicator(): boolean {
+        return !!this.getNetReplicator();
+    }
+
+    private getNetReplicator(): EnemyNetReplicator | null {
+        return this.getComponent(EnemyNetReplicator);
     }
 }
