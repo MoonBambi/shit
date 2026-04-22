@@ -2,6 +2,8 @@ const { WebSocketServer } = require('ws');
 
 const port = Number(process.env.PORT || 8080);
 const wss = new WebSocketServer({ port });
+const connectionTimeoutMs = Number(process.env.CONNECTION_TIMEOUT_MS || 15000);
+const cleanupIntervalMs = Number(process.env.CLEANUP_INTERVAL_MS || 5000);
 
 const rooms = new Map();
 let nextPlayerId = 1;
@@ -25,6 +27,10 @@ function safeSend(ws, message) {
         return;
     }
     ws.send(JSON.stringify(message));
+}
+
+function markClientAlive(ws) {
+    ws.lastSeenAt = Date.now();
 }
 
 function broadcast(room, message, exceptPlayerId = null) {
@@ -230,8 +236,10 @@ function onFoodDestroy(ws, payload) {
 wss.on('connection', (ws) => {
     ws.roomId = null;
     ws.playerId = null;
+    ws.lastSeenAt = Date.now();
 
     ws.on('message', (rawData) => {
+        markClientAlive(ws);
         let payload = null;
         try {
             payload = JSON.parse(rawData.toString());
@@ -263,6 +271,9 @@ wss.on('connection', (ws) => {
             case 'food_destroy':
                 onFoodDestroy(ws, payload);
                 break;
+            case 'ping':
+                safeSend(ws, { t: 'pong' });
+                break;
             default:
                 safeSend(ws, { t: 'error', code: 'unknown_event', message: 'Unknown event type.' });
                 break;
@@ -277,5 +288,32 @@ wss.on('connection', (ws) => {
         removeFromRoom(ws);
     });
 });
+
+setInterval(() => {
+    const now = Date.now();
+    const timeout = Math.max(1000, connectionTimeoutMs);
+    const staleSockets = [];
+
+    for (const room of rooms.values()) {
+        for (const client of room.clients.values()) {
+            if (client.readyState !== client.OPEN) {
+                staleSockets.push(client);
+                continue;
+            }
+            const lastSeenAt = Number(client.lastSeenAt || 0);
+            if (!lastSeenAt || now - lastSeenAt > timeout) {
+                staleSockets.push(client);
+            }
+        }
+    }
+
+    for (const client of staleSockets) {
+        try {
+            client.close();
+        } catch (_error) {
+            removeFromRoom(client);
+        }
+    }
+}, Math.max(1000, cleanupIntervalMs));
 
 console.log(`[server] WebSocket room server running on ws://127.0.0.1:${port}`);

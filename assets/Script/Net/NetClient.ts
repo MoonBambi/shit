@@ -77,11 +77,11 @@ export class NetClient extends Component {
     @property({ tooltip: 'Fallback TTL seconds for remote skill instances.' })
     public remoteSkillFallbackTtlSeconds: number = 180;
 
-    @property({ tooltip: 'Enable debug logs in NetClient.update().' })
-    public debugUpdateLog: boolean = false;
+    @property({ tooltip: 'Heartbeat interval in seconds.' })
+    public heartbeatIntervalSeconds: number = 2;
 
-    @property({ tooltip: 'Interval seconds for update debug logs.' })
-    public debugUpdateLogIntervalSeconds: number = 0.5;
+    @property({ tooltip: 'Heartbeat timeout in seconds.' })
+    public heartbeatTimeoutSeconds: number = 6;
 
     private _socket: WebSocket | null = null;
     private _isConnected: boolean = false;
@@ -92,7 +92,8 @@ export class NetClient extends Component {
     private _lastSentMs: number = 0;
     private _skillCastSeq: number = 0;
     private _reconnectScheduled: boolean = false;
-    private _debugUpdateLogCooldown: number = 0;
+    private _heartbeatElapsedSeconds: number = 0;
+    private _lastPongMs: number = 0;
 
     private readonly _remoteTargetPos: Vec3 = v3();
     private readonly _remoteVisualPos: Vec3 = v3();
@@ -135,15 +136,11 @@ export class NetClient extends Component {
     }
 
     update(dt: number) {
-        if (this.debugUpdateLog) {
-            this._debugUpdateLogCooldown = Math.max(0, this._debugUpdateLogCooldown - dt);
-            if (this._debugUpdateLogCooldown <= 0) {
-                this._debugUpdateLogCooldown = Math.max(0.05, this.debugUpdateLogIntervalSeconds);
-                console.log(
-                    `[NetClient:update] dt=${dt.toFixed(4)} connected=${this._isConnected} hasRemote=${this._remoteHasState}`,
-                );
-            }
+        if (dt <= 0) {
+            return;
         }
+
+        this.updateHeartbeat(dt);
 
         if (!this._remoteHasState || !this.remotePlayer || !this.remotePlayer.isValid) {
             return;
@@ -177,6 +174,7 @@ export class NetClient extends Component {
         this._socket.onopen = () => {
             this._isConnected = true;
             this.cancelReconnect();
+            this.resetHeartbeat();
             this.sendRaw({ t: 'join', roomId: this.roomId });
         };
 
@@ -385,6 +383,7 @@ export class NetClient extends Component {
                 this._remotePlayerId = '';
                 this._remoteHasState = false;
                 this._gameStarted = false;
+                this.resetHeartbeat();
                 break;
             case 'role':
                 this._isHost = !!message.isHost;
@@ -402,6 +401,12 @@ export class NetClient extends Component {
                     this._remoteHasState = false;
                     this._gameStarted = false;
                 }
+                break;
+            case 'ping':
+                this.sendRaw({ t: 'pong' });
+                break;
+            case 'pong':
+                this._lastPongMs = Date.now();
                 break;
             case 'peer_state':
                 this.applyPeerState(message);
@@ -670,6 +675,8 @@ export class NetClient extends Component {
         this._remoteHasState = false;
         this._gameStarted = false;
         this._skillNodesByCastId.clear();
+        this._heartbeatElapsedSeconds = 0;
+        this._lastPongMs = 0;
     }
 
     private scheduleReconnect() {
@@ -690,5 +697,30 @@ export class NetClient extends Component {
         }
         this.unschedule(this._reconnectTask);
         this._reconnectScheduled = false;
+    }
+
+    private resetHeartbeat() {
+        this._heartbeatElapsedSeconds = 0;
+        this._lastPongMs = Date.now();
+    }
+
+    private updateHeartbeat(dt: number) {
+        if (!this._isConnected || !this._socket || this._socket.readyState !== WebSocket.OPEN) {
+            return;
+        }
+
+        const interval = Math.max(0.2, this.heartbeatIntervalSeconds);
+        const timeoutSeconds = Math.max(interval, this.heartbeatTimeoutSeconds);
+
+        this._heartbeatElapsedSeconds += dt;
+        if (this._heartbeatElapsedSeconds >= interval) {
+            this._heartbeatElapsedSeconds = 0;
+            this.sendRaw({ t: 'ping' });
+        }
+
+        const now = Date.now();
+        if (this._lastPongMs > 0 && now - this._lastPongMs > timeoutSeconds * 1000) {
+            this.disconnect();
+        }
     }
 }

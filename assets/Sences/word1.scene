@@ -230,8 +230,8 @@
     },
     "remoteSkillParent": null,
     "remoteSkillFallbackTtlSeconds": 180,
-    "debugUpdateLog": true,
-    "debugUpdateLogIntervalSeconds": 0.5,
+    "heartbeatIntervalSeconds": 2,
+    "heartbeatTimeoutSeconds": 6,
     "_id": "a2bhOkcDdAxZ9Av0D+UDOk"
   },
   {
